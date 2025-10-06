@@ -1,0 +1,28 @@
+{
+  "name": "electron",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "electron .",
+    "dev": "concurrently \"npm run react\" \"npm run electron\"",
+    "react": "cd ../react-ui/vite-project && npm run dev",
+    "electron": "nodemon --exec electron . --watch ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.2.2",
+    "electron": "^38.0.0",
+    "fs-extra": "^11.3.1",
+    "mongoose": "^8.18.1",
+    "screenshot-desktop": "^1.15.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "electron-reload": "^2.0.0-alpha.1",
+    "nodemon": "^3.1.10"
+  }
+}
