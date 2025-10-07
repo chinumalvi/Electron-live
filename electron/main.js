@@ -17,9 +17,9 @@ const { saveIdleReason } = require("./services/reasonService");
 
 // -------------------------- GLOBAL VARIABLES --------------------------
 let mainWindow;
-let currentActivity = null; // current session (Active / Idle / Away)
+let currentActivity = null; // tracks current session
 let countdown = null;       // countdown for idle reason modal
-
+let isCountdownActive = false;
 // -------------------------- CONNECT TO MONGODB --------------------------
 connectDB(process.env.MONGO_URI);
 
@@ -48,15 +48,14 @@ app.whenReady().then(() => {
 });
 
 // -------------------------- IDLE / ACTIVE / AWAY TRACKING --------------------------
+
 function startIdleTracking() {
-  const idleThresholdSec = 60;  // 1 min idle = Idle
-  const awayThresholdSec = 300; // 5 min idle = Away
-  const countdownSec = 15;      // countdown before showing idle reason modal
+  const idleThresholdSec = 60;  
+  const awayThresholdSec = 300; 
+  const countdownSec = 15;
 
   setInterval(async () => {
-    const idleTime = powerMonitor.getSystemIdleTime(); // seconds
-
-    // Determine session status
+    const idleTime = powerMonitor.getSystemIdleTime(); 
     let status;
     if (idleTime >= awayThresholdSec) status = "Away";
     else if (idleTime >= idleThresholdSec) status = "Idle";
@@ -64,15 +63,12 @@ function startIdleTracking() {
 
     const now = new Date();
 
-    // ----- Handle session change -----
     if (!currentActivity || currentActivity.status !== status) {
-      // Close previous session
       if (currentActivity) {
         currentActivity.endTime = now;
         const spentTime = currentActivity.endTime - currentActivity.startTime;
-
         await Activity.create({
-          userId: "test-user",
+          userId: currentActivity.userId || "test-user",
           startTime: currentActivity.startTime,
           endTime: currentActivity.endTime,
           spentTime,
@@ -83,30 +79,40 @@ function startIdleTracking() {
         });
       }
 
-      // Start new session
       currentActivity = {
+        userId: "test-user",
         status,
         startTime: now,
         screenshotPath: null,
         reasonStatus: "",
       };
+
+      // Reset countdown flags when starting new session
+      countdown = null;
+      isCountdownActive = false;
     }
 
-    // ----- Countdown logic for Idle Reason -----
-    if (status === "Idle") {
-      if (countdown === null) countdown = countdownSec;
-      countdown -= 1;
-      mainWindow.webContents.send("update-countdown", countdown);
+    if (status === "Idle" && !currentActivity.reasonStatus) {
+      if (!isCountdownActive) {
+        countdown = countdownSec;
+        isCountdownActive = true;
+      }
 
-      if (countdown <= 0) {
+      if (countdown > 0) {
+        countdown -= 1;
+        mainWindow.webContents.send("update-countdown", countdown);
+      } else if (countdown === 0) {
         mainWindow.webContents.send("show-reason-modal");
+        // Pause idle tracking here by setting countdown to null
         countdown = null;
+        isCountdownActive = false;
       }
     } else {
+      // reset countdown if user becomes active
       countdown = null;
+      isCountdownActive = false;
     }
 
-    // ----- Send live metrics to UI -----
     const metrics = await calculateTodayMetrics("test-user");
     mainWindow.webContents.send("update-times", metrics);
 
@@ -131,24 +137,38 @@ function startAutoScreenshot() {
 // -------------------------- SAVE IDLE REASON --------------------------
 ipcMain.handle("save-idle-reason", async (event, reason) => {
   try {
-    if (currentActivity && currentActivity.status === "Idle") {
-      currentActivity.reasonStatus = reason;
+    if (!currentActivity) {
+      return { success: false, error: "No current session found" };
+    }
 
-      // Save to MongoDB immediately
-      await Activity.create({
-        userId: "test-user",                     // replace with actual user id
-        startTime: currentActivity.startTime,    // session start
-        endTime: new Date(),                     // end now
-        spentTime: 0,                            // optional, can calculate later
+    currentActivity.reasonStatus = reason;
+
+    if (currentActivity._id) {
+      // Update existing session in DB
+      await Activity.findByIdAndUpdate(currentActivity._id, {
+        reasonStatus: reason,
+      });
+    } else {
+      // Save new session in DB
+      const activity = await Activity.create({
+        userId: currentActivity.userId || "test-user",
+        startTime: currentActivity.startTime,
+        endTime: currentActivity.endTime || null,
+        spentTime: currentActivity.endTime
+          ? currentActivity.endTime - currentActivity.startTime
+          : null,
         userActivityStatus: currentActivity.status,
-        workingStatus: "Break",                  // because Idle
+        workingStatus:
+          currentActivity.status === "Active" ? "Working" : "Break",
         reasonStatus: reason,
         screenshotPath: currentActivity.screenshotPath || null,
       });
-
-      // Optional: still save to JSON if your service uses it
-      await saveIdleReason(reason);
+      currentActivity._id = activity._id;
     }
+
+    // Optional: also save to local JSON
+    await saveIdleReason(reason);
+
     return { success: true };
   } catch (err) {
     console.error("save-idle-reason error:", err);
@@ -156,7 +176,7 @@ ipcMain.handle("save-idle-reason", async (event, reason) => {
   }
 });
 
-// -------------------------- GET PRODUCTIVE / IDLE / AWAY METRICS --------------------------
+// -------------------------- GET PRODUCTIVE TIME --------------------------
 ipcMain.handle("get-productive-time", async () => {
   const metrics = await calculateTodayMetrics("test-user");
   return { success: true, ...metrics };
@@ -165,31 +185,33 @@ ipcMain.handle("get-productive-time", async () => {
 // -------------------------- GET IDLE TIME --------------------------
 ipcMain.handle("get-idle-time", async () => {
   try {
-    return powerMonitor.getSystemIdleTime(); // seconds
+    return powerMonitor.getSystemIdleTime();
   } catch (err) {
     console.error("get-idle-time error:", err);
     return 0;
   }
 });
 
-// -------------------------- GET ALL SESSIONS FOR TODAY --------------------------
+// -------------------------- GET ALL SESSIONS --------------------------
 ipcMain.handle("get-activities", async () => {
   const todayStart = new Date();
-  todayStart.setHours(0,0,0,0);
+  todayStart.setHours(0, 0, 0, 0);
   const todayEnd = new Date();
-  todayEnd.setHours(23,59,59,999);
+  todayEnd.setHours(23, 59, 59, 999);
 
   let sessions = await Activity.find({
     userId: "test-user",
     startTime: { $gte: todayStart, $lte: todayEnd },
   }).lean();
 
-  // add current ongoing session if exists
+  // Include current ongoing session
   if (currentActivity) {
     sessions.push({
       ...currentActivity,
       startTime: currentActivity.startTime.toISOString(),
-      endTime: currentActivity.endTime ? currentActivity.endTime.toISOString() : null,
+      endTime: currentActivity.endTime
+        ? currentActivity.endTime.toISOString()
+        : null,
       userActivityStatus: currentActivity.status,
       reasonStatus: currentActivity.reasonStatus || "",
       screenshotPath: currentActivity.screenshotPath || null,
@@ -212,32 +234,25 @@ async function calculateTodayMetrics(userId) {
     startTime: { $gte: todayStart, $lte: todayEnd },
   });
 
-  if (!sessions.length) return {
-    startTime: null,
-    endTime: null,
-    totalSpendTime: 0,
-    idleTime: 0,
-    awayTime: 0,
-    nonProductiveTime: 0,
-    productiveTime: 0,
-    productiveHours: "0.00",
-    productiveMinutes: 0,
-  };
-
-  const startTimeArr = sessions.map(s => s.startTime).filter(Boolean).map(d => d.getTime());
-  const endTimeArr = sessions.map(s => s.endTime ? s.endTime.getTime() : Date.now());
-
-  const startTime = startTimeArr.length ? Math.min(...startTimeArr) : null;
-  const endTime = endTimeArr.length ? Math.max(...endTimeArr) : null;
-  const totalSpendTime = startTime && endTime ? endTime - startTime : 0;
+  if (!sessions.length)
+    return {
+      startTime: null,
+      endTime: null,
+      totalSpendTime: 0,
+      idleTime: 0,
+      awayTime: 0,
+      nonProductiveTime: 0,
+      productiveTime: 0,
+      productiveHours: "0.00",
+      productiveMinutes: 0,
+    };
 
   let idleTime = 0;
   let awayTime = 0;
 
-  sessions.forEach(s => {
+  sessions.forEach((s) => {
     const start = s.startTime ? s.startTime.getTime() : null;
     const end = s.endTime ? s.endTime.getTime() : Date.now();
-
     if (start !== null) {
       const duration = end - start;
       if (s.userActivityStatus === "Idle") idleTime += duration;
@@ -246,16 +261,28 @@ async function calculateTodayMetrics(userId) {
   });
 
   const nonProductiveTime = idleTime + awayTime;
+  const totalSpendTime =
+    idleTime +
+    awayTime +
+    sessions.reduce((acc, s) => {
+      if (s.userActivityStatus === "Active") {
+        const start = s.startTime ? s.startTime.getTime() : 0;
+        const end = s.endTime ? s.endTime.getTime() : Date.now();
+        return acc + (end - start);
+      }
+      return acc;
+    }, 0);
+
   const productiveTime = totalSpendTime - nonProductiveTime;
 
   return {
-    startTime: startTime ? new Date(startTime).toISOString() : null,
-    endTime: endTime ? new Date(endTime).toISOString() : null,
+    startTime: sessions[0].startTime,
+    endTime: sessions[sessions.length - 1].endTime || new Date(),
     totalSpendTime,
-    idleTime,
-    awayTime,
-    nonProductiveTime,
-    productiveTime,
+    idleTime: Math.floor(idleTime / 60000), // minutes
+    awayTime: Math.floor(awayTime / 60000),
+    nonProductiveTime: Math.floor(nonProductiveTime / 60000),
+    productiveTime: Math.floor(productiveTime / 60000),
     productiveHours: (productiveTime / 3600000).toFixed(2),
     productiveMinutes: Math.floor(productiveTime / 60000),
   };

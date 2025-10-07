@@ -1,88 +1,86 @@
-import { useState, useEffect } from "react";
+// ReasonModal.jsx
+import { useEffect, useState } from "react";
 
 export default function ReasonModal() {
   const [isOpen, setIsOpen] = useState(false);
   const [reason, setReason] = useState("");
-  const [countdown, setCountdown] = useState(0);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    // Listen for main process event to open modal
-    window.electronAPI.onShowReasonModal(() => setIsOpen(true));
+    // open modal when main process signals
+    const openHandler = () => setIsOpen(true);
+    window.electronAPI.onShowReasonModal(openHandler);
 
-    // Listen for countdown updates
-    window.electronAPI.onUpdateCountdown((time) => setCountdown(time));
-
+    // cleanup (ipcRenderer.on returns a subscription but removing is optional here)
+    return () => {
+      // no-op: electron will remove listeners on reload; add removal if needed
+    };
   }, []);
 
-  useEffect(() => {
-    if (!isOpen) setReason("");
-  }, [isOpen]);
+  const handleClose = () => {
+    setIsOpen(false);
+    setReason("");
+    setSaving(false);
+  };
 
   const handleSubmit = async () => {
     if (!reason.trim()) {
       alert("Please enter a reason");
       return;
     }
+    setSaving(true);
     try {
       const res = await window.electronAPI.saveIdleReason(reason.trim());
-      if (res?.success) {
-        alert("Reason saved successfully ✅");
-        setIsOpen(false);
+      if (res && res.success) {
+        alert("Reason saved ✅");
+        handleClose();
       } else {
-        alert("Save failed: " + (res?.error || "Unknown error"));
+        alert("Save failed: " + (res?.error || "Unknown"));
+        setSaving(false);
       }
     } catch (err) {
-      console.error(err);
-      alert("Error while saving reason");
+      console.error("save error:", err);
+      alert("Save failed");
+      setSaving(false);
     }
   };
 
   if (!isOpen) return null;
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        left: "50%",
-        top: "50%",
-        transform: "translate(-50%, -50%)",
-        width: 400,
-        background: "white",
-        padding: 20,
-        boxShadow: "0 0 12px rgba(0,0,0,0.25)",
-        zIndex: 9999,
-        borderRadius: 8,
-        pointerEvents: "auto",
-      }}
-    >
-      <h3>🟡 Why were you away?</h3>
-      <p>Time left: {countdown}s</p>
+    <div style={{
+      position: "fixed",
+      left: "50%",
+      top: "50%",
+      transform: "translate(-50%, -50%)",
+      width: 420,
+      background: "#fff",
+      padding: 18,
+      boxShadow: "0 6px 26px rgba(0,0,0,0.25)",
+      zIndex: 9999,
+      borderRadius: 8,
+    }}>
+      <h3 style={{ margin: 0 }}>🟡 Why were you away?</h3>
+      <p style={{ color: "#666", marginTop: 6 }}>Please enter a reason for the idle time.</p>
+
       <textarea
-        rows="4"
+        rows={4}
         value={reason}
         onChange={(e) => setReason(e.target.value)}
-        style={{
-          width: "100%",
-          marginTop: 10,
-          borderRadius: 6,
-          padding: 8,
-          border: "1px solid #ccc",
-        }}
+        style={{ width: "100%", padding: 8, borderRadius: 6, border: "1px solid #ddd" }}
         autoFocus
       />
-      <div style={{ textAlign: "right", marginTop: 10 }}>
-        <button
-          onClick={handleSubmit}
-          style={{
-            padding: "6px 12px",
-            background: "#1976d2",
-            color: "#fff",
-            border: "none",
-            borderRadius: 6,
-            cursor: "pointer",
-          }}
-        >
-          Submit
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+        <button onClick={handleSubmit} disabled={saving} style={{
+          padding: "8px 14px",
+          background: "#1976d2",
+          color: "#fff",
+          border: "none",
+          borderRadius: 6,
+          cursor: "pointer"
+        }}>
+          {saving ? "Saving..." : "Submit"}
         </button>
       </div>
     </div>
