@@ -2,28 +2,26 @@
 
 // --- Load environment variables ---
 require("dotenv").config();
-
-// --- DB imports ---
 const connectDB = require("./services/db/connect");
 const Activity = require("./services/db/models/Activity");
 
-// --- Electron imports ---
 const { app, BrowserWindow, ipcMain, powerMonitor } = require("electron");
 const path = require("path");
 
-// --- Services imports ---
 const { takeScreenshot } = require("./services/screenshotService");
 const { saveIdleReason } = require("./services/reasonService");
 
-// -------------------------- GLOBAL VARIABLES --------------------------
+const bcrypt = require("bcryptjs");
+const User = require("./services/db/models/User");
+
 let mainWindow;
-let currentActivity = null; // tracks current session
-let countdown = null;       // countdown for idle reason modal
+let currentActivity = null;
+let countdown = null;
 let isCountdownActive = false;
-// -------------------------- CONNECT TO MONGODB --------------------------
+global.currentUser = null; // <— store logged-in user globally
+
 connectDB(process.env.MONGO_URI);
 
-// -------------------------- CREATE ELECTRON WINDOW --------------------------
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 800,
@@ -46,6 +44,163 @@ app.whenReady().then(() => {
   startIdleTracking();
   startAutoScreenshot();
 });
+
+// -------------------------- AUTH IPC HANDLERS --------------------------
+
+// ----- REGISTER USER -----
+ipcMain.handle("registerUser", async (event, { username, password, role = "user" }) => {
+  try {
+    if (!username || !password)
+      return { success: false, error: "Missing username or password" };
+
+    const existing = await User.findOne({ username });
+    if (existing) return { success: false, error: "User already exists" };
+
+    const adminExists = await User.exists({ role: "admin" });
+    if (adminExists && (!global.currentUser || global.currentUser.role !== "admin")) {
+      return { success: false, error: "Only admin can create new users" };
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const newUser = await User.create({ username, passwordHash: hash, role });
+
+    return { success: true, user: { id: newUser._id.toString(), username, role } };
+  } catch (err) {
+    console.error("registerUser error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
+// ----- LOGIN USER -----
+ipcMain.handle("loginUser", async (event, { username, password }) => {
+  try {
+    const user = await User.findOne({ username });
+    if (!user) return { success: false, error: "User not found" };
+
+    const valid = await bcrypt.compare(password, user.passwordHash);
+    if (!valid) return { success: false, error: "Invalid password" };
+
+    global.currentUser = { _id: user._id, username: user.username, role: user.role };
+    console.log("User logged in:", global.currentUser);
+
+    currentActivity = null;
+    countdown = null;
+    isCountdownActive = false;
+
+    return { success: true, user: global.currentUser };
+  } catch (err) {
+    console.error("loginUser error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
+// ----- LOGOUT USER -----
+ipcMain.handle("logoutUser", async () => {
+  try {
+    if (currentActivity) {
+      currentActivity.endTime = new Date();
+      const spentTime = currentActivity.endTime - currentActivity.startTime;
+      await Activity.create({
+        userId: currentActivity.userId,
+        startTime: currentActivity.startTime,
+        endTime: currentActivity.endTime,
+        spentTime,
+        userActivityStatus: currentActivity.status,
+        workingStatus: currentActivity.status === "Active" ? "Working" : "Break",
+        reasonStatus: currentActivity.reasonStatus || "",
+        screenshotPath: currentActivity.screenshotPath || null,
+      });
+    }
+    global.currentUser = null;
+    currentActivity = null;
+    countdown = null;
+    isCountdownActive = false;
+
+    return { success: true };
+  } catch (err) {
+    console.error("logoutUser error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
+// ----- GET CURRENT USER -----
+ipcMain.handle("getCurrentUser", async () => {
+  return global.currentUser
+    ? { success: true, user: global.currentUser }
+    : { success: true, user: null };
+});
+
+// -------------------------- ADMIN USER MANAGEMENT --------------------------
+
+// ----- admin-get-users -----
+ipcMain.handle("admin-get-users", async () => {
+  try {
+    if (!global.currentUser || global.currentUser.role !== "admin")
+      return { success: false, error: "Unauthorized" };
+
+    const users = await User.find().select("-passwordHash").lean();
+    return { success: true, users };
+  } catch (err) {
+    console.error("admin-get-users error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
+// ----- admin-create-user -----
+ipcMain.handle("admin-create-user", async (event, { username, password, role }) => {
+  try {
+    if (!global.currentUser || global.currentUser.role !== "admin")
+      return { success: false, error: "Unauthorized" };
+
+    const exists = await User.findOne({ username });
+    if (exists) return { success: false, error: "User already exists" };
+
+    const hash = await bcrypt.hash(password, 10);
+    const newUser = await User.create({ username, passwordHash: hash, role });
+
+    return { success: true, user: { id: newUser._id.toString(), username, role } };
+  } catch (err) {
+    console.error("admin-create-user error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
+// ----- admin-update-user -----
+ipcMain.handle("admin-update-user", async (event, { id, username, password, role }) => {
+  try {
+    if (!global.currentUser || global.currentUser.role !== "admin")
+      return { success: false, error: "Unauthorized" };
+
+    const updates = {};
+    if (username) updates.username = username;
+    if (password) updates.passwordHash = await bcrypt.hash(password, 10);
+    if (role) updates.role = role;
+
+    const updated = await User.findByIdAndUpdate(id, updates, { new: true }).select(
+      "-passwordHash"
+    );
+
+    return { success: true, user: updated };
+  } catch (err) {
+    console.error("admin-update-user error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
+// ----- admin-delete-user -----
+ipcMain.handle("admin-delete-user", async (event, id) => {
+  try {
+    if (!global.currentUser || global.currentUser.role !== "admin")
+      return { success: false, error: "Unauthorized" };
+
+    await User.findByIdAndDelete(id);
+    return { success: true };
+  } catch (err) {
+    console.error("admin-delete-user error:", err);
+    return { success: false, error: err.message };
+  }
+});
+
 
 // -------------------------- IDLE / ACTIVE / AWAY TRACKING --------------------------
 
@@ -287,3 +442,6 @@ async function calculateTodayMetrics(userId) {
     productiveMinutes: Math.floor(productiveTime / 60000),
   };
 }
+
+
+
